@@ -68,7 +68,7 @@ const (
 	ttimeMsField       = 61
 
 	excludedServerStates = ""
-	showStatCmd          = "show stat\n"
+	showStatCmd          = "show stat\n" // HAProxy统计命令
 	showInfoCmd          = "show info\n"
 )
 
@@ -79,10 +79,11 @@ var (
 )
 
 type metricInfo struct {
-	Desc *prometheus.Desc
-	Type prometheus.ValueType
+	Desc *prometheus.Desc     // Prometheus指标描述符
+	Type prometheus.ValueType // 指标类型（Gauge/Counter等）
 }
 
+// 前端指标构造器
 func newFrontendMetric(metricName string, docString string, t prometheus.ValueType, constLabels prometheus.Labels) metricInfo {
 	return metricInfo{
 		Desc: prometheus.NewDesc(
@@ -239,17 +240,18 @@ var (
 
 // Exporter collects HAProxy stats from the given URI and exports them using
 // the prometheus metrics package.
+// Exporter核心结构（数据采集枢纽）
 type Exporter struct {
 	URI       string
-	mutex     sync.RWMutex
-	fetchInfo func() (io.ReadCloser, error)
-	fetchStat func() (io.ReadCloser, error)
+	mutex     sync.RWMutex                  // 并发控制锁
+	fetchInfo func() (io.ReadCloser, error) // 元数据获取方法
+	fetchStat func() (io.ReadCloser, error) // 统计信息获取方法
 
 	up                             prometheus.Gauge
-	totalScrapes, csvParseFailures prometheus.Counter
-	serverMetrics                  map[int]metricInfo
-	excludedServerStates           map[string]struct{}
-	logger                         log.Logger
+	totalScrapes, csvParseFailures prometheus.Counter  // 总采集次数  CSV解析失败计数
+	serverMetrics                  map[int]metricInfo  // 服务器指标映射
+	excludedServerStates           map[string]struct{} // 排除的服务器状态
+	logger                         log.Logger          // 日志记录器
 }
 
 // NewExporter returns an initialized Exporter.
@@ -264,6 +266,7 @@ func NewExporter(uri string, sslVerify, proxyFromEnv bool, selectedServerMetrics
 	switch u.Scheme {
 	case "http", "https", "file":
 		fetchStat = fetchHTTP(uri, sslVerify, proxyFromEnv, timeout)
+	// 本地socket连接
 	case "unix":
 		fetchInfo = fetchUnix("unix", u.Path, showInfoCmd, timeout)
 		fetchStat = fetchUnix("unix", u.Path, showStatCmd, timeout)
@@ -306,6 +309,8 @@ func NewExporter(uri string, sslVerify, proxyFromEnv bool, selectedServerMetrics
 
 // Describe describes all the metrics ever exported by the HAProxy exporter. It
 // implements prometheus.Collector.
+// 注册所有要导出的指标
+// 使得prometheus可以预先了解所有可用的指标，确保后续的数据和抓取过程顺利进行。
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	for _, m := range frontendMetrics {
 		ch <- m.Desc
@@ -325,20 +330,51 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect fetches the stats from configured HAProxy location and delivers them
 // as Prometheus metrics. It implements prometheus.Collector.
+
+// chan<-：单向通道（只写模式）
+// prometheus.Metric：指标数据必须实现的接口类型
+// 作用：将生成的指标对象写入这个管道，最终被Prometheus服务器收集
+// [Prometheus Server] ← ch通道 ← [Collect方法] ← [HAProxy数据]
+
+// Prometheus通过Collector接口实现插件化架构
+// Prometheus Collector接口定义
+// interface Collector {
+//     Describe(chan<- *Desc)
+//     Collect(chan<- Metric)  // 必须实现的方法
+// }
+
+// Prometheus客户端库内部调用逻辑
+// for _, c := range collectors {
+//     c.Collect(metricsChan) // 遍历所有注册的Collector
+// }
+
+// 实现必要性：
+// 1. 接口契约：满足prometheus.Register()的注册要求
+// 2. 数据管道：提供指标数据的唯一入口
+// 3. 生命周期：由Prometheus服务端控制采集节奏
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.mutex.Lock() // To protect metrics from concurrent collects.
 	defer e.mutex.Unlock()
 
-	up := e.scrape(ch)
+	up := e.scrape(ch) // 核心采集逻辑
 
+	// 推送基础指标
 	ch <- prometheus.MustNewConstMetric(haproxyUp, prometheus.GaugeValue, up)
-	ch <- e.totalScrapes
+	ch <- e.totalScrapes // 总采集次数计数器
 	ch <- e.csvParseFailures
 }
 
 func fetchHTTP(uri string, sslVerify, proxyFromEnv bool, timeout time.Duration) func() (io.ReadCloser, error) {
+	// 	核心功能：
+
+	// 创建支持HTTPS和代理的HTTP客户端
+	// 实现自动重试机制（通过闭包特性）
+	// 严格的状态码检查（200-299为有效响应）
+
+	// 创建定制化HTTP客户端
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: !sslVerify}}
 	if proxyFromEnv {
+		// 启用环境代理
 		tr.Proxy = http.ProxyFromEnvironment
 	}
 	client := http.Client{
@@ -347,6 +383,7 @@ func fetchHTTP(uri string, sslVerify, proxyFromEnv bool, timeout time.Duration) 
 	}
 
 	return func() (io.ReadCloser, error) {
+		// 发起GET请求
 		resp, err := client.Get(uri)
 		if err != nil {
 			return nil, err
@@ -355,20 +392,24 @@ func fetchHTTP(uri string, sslVerify, proxyFromEnv bool, timeout time.Duration) 
 			resp.Body.Close()
 			return nil, fmt.Errorf("HTTP status %d", resp.StatusCode)
 		}
+		// 返回可读的响应体
 		return resp.Body, nil
 	}
 }
 
 func fetchUnix(scheme, address, cmd string, timeout time.Duration) func() (io.ReadCloser, error) {
 	return func() (io.ReadCloser, error) {
+		// 建立连接
 		f, err := net.DialTimeout(scheme, address, timeout)
 		if err != nil {
 			return nil, err
 		}
+		// 设置双超时
 		if err := f.SetDeadline(time.Now().Add(timeout)); err != nil {
 			f.Close()
 			return nil, err
 		}
+		// 发送统计命令
 		n, err := io.WriteString(f, cmd)
 		if err != nil {
 			f.Close()
@@ -378,6 +419,7 @@ func fetchUnix(scheme, address, cmd string, timeout time.Duration) func() (io.Re
 			f.Close()
 			return nil, errors.New("write error")
 		}
+		// 返回连接对象
 		return f, nil
 	}
 }
@@ -565,6 +607,7 @@ func filterServerMetrics(filter string) (map[int]metricInfo, error) {
 }
 
 func main() {
+	// 定义PID文件帮助信息
 	const pidFileHelpText = `Path to HAProxy pid file.
 
 	If provided, the standard process metrics get exported for the HAProxy
@@ -574,9 +617,28 @@ func main() {
 
 	https://prometheus.io/docs/instrumenting/writing_clientlibs/#process-metrics.`
 
+	// 	var (
+	//     webConfig                  = webflag.AddFlags(kingpin.CommandLine, ":9101") // 定义web监听地址
+	//     metricsPath                = kingpin.Flag("web.telemetry-path", ...)        // 指标暴露路径
+	//     haProxyScrapeURI           = kingpin.Flag("haproxy.scrape-uri", ...)        // HAProxy统计接口URI
+	//     haProxySSLVerify           = kingpin.Flag("haproxy.ssl-verify", ...)        // SSL证书验证开关
+	//     haProxyServerMetricFields  = kingpin.Flag("haproxy.server-metric-fields", ...) // 导出的服务器指标字段
+	//     haProxyServerExcludeStates = kingpin.Flag("haproxy.server-exclude-states", ...) // 排除的服务器状态
+	//     haProxyTimeout             = kingpin.Flag("haproxy.timeout", ...)            // 采集超时时间
+	//     haProxyPidFile             = kingpin.Flag("haproxy.pid-file", ...)          // PID文件路径
+	//     httpProxyFromEnv           = kingpin.Flag("http.proxy-from-env", ...)        // 代理环境变量开关
+	// )
+	// 声明命令行参数变量
+	// 	作用时机：
+
+	// 1. 程序启动阶段：当执行haproxy_exporter时，kingpin库会自动解析命令行参数
+	// 2. 配置初始化阶段：main函数开始执行前完成参数解析（Go的init函数特性）
+	// 3. 运行时阶段：各模块（如数据采集器、web服务器）根据这些参数值进行初始化
 	var (
-		webConfig                  = webflag.AddFlags(kingpin.CommandLine, ":9101")
-		metricsPath                = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		webConfig   = webflag.AddFlags(kingpin.CommandLine, ":9101")
+		metricsPath = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		// 设置访问地址，默认为http://localhost/，且强制要求返回csv格式的统计数据
+		// http://localhost/：假设HAProxy与exporter同主机
 		haProxyScrapeURI           = kingpin.Flag("haproxy.scrape-uri", "URI on which to scrape HAProxy.").Default("http://localhost/;csv").String()
 		haProxySSLVerify           = kingpin.Flag("haproxy.ssl-verify", "Flag that enables SSL certificate verification for the scrape URI").Default("true").Bool()
 		haProxyServerMetricFields  = kingpin.Flag("haproxy.server-metric-fields", "Comma-separated list of exported server metrics. See http://cbonte.github.io/haproxy-dconv/configuration-1.5.html#9.1").Default(serverMetrics.String()).String()
@@ -585,31 +647,47 @@ func main() {
 		haProxyPidFile             = kingpin.Flag("haproxy.pid-file", pidFileHelpText).Default("").String()
 		httpProxyFromEnv           = kingpin.Flag("http.proxy-from-env", "Flag that enables using HTTP proxy settings from environment variables ($http_proxy, $https_proxy, $no_proxy)").Default("false").Bool()
 	)
+	// kingpin是Go语言命令行解析库
+	// 	核心作用：
 
+	// 1. 参数声明：通过kingpin.Flag()定义12个命令行参数
+	// 2. 类型安全：自动转换Duration/Bool/String等类型
+	// 3. 帮助系统：自动生成--help文档
+
+	// 配置日志系统
 	promlogConfig := &promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, promlogConfig)
-	kingpin.Version(version.Print("haproxy_exporter"))
-	kingpin.HelpFlag.Short('h')
+	kingpin.Version(version.Print("haproxy_exporter")) // 注入版本信息
+	kingpin.HelpFlag.Short('h')                        // 定义-h帮助参数
 	kingpin.Parse()
+	// 初始化日志记录器                                   // 解析命令行参数
 	logger := promlog.New(promlogConfig)
 
+	// 过滤配置的服务器指标
 	selectedServerMetrics, err := filterServerMetrics(*haProxyServerMetricFields)
 	if err != nil {
+		// 错误日志记录
 		level.Error(logger).Log("msg", "Error filtering server metrics", "err", err)
 		os.Exit(1)
 	}
 
+	// 打印启动信息
 	level.Info(logger).Log("msg", "Starting haproxy_exporter", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
 
+	// 创建Exporter实例
 	exporter, err := NewExporter(*haProxyScrapeURI, *haProxySSLVerify, *httpProxyFromEnv, selectedServerMetrics, *haProxyServerExcludeStates, *haProxyTimeout, logger)
 	if err != nil {
+		// 创建失败处理
 		level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
 		os.Exit(1)
 	}
+
+	// 注册指标收集器
 	prometheus.MustRegister(exporter)
 	prometheus.MustRegister(version.NewCollector("haproxy_exporter"))
 
+	// 注册进程指标（如果配置了PID文件）
 	if *haProxyPidFile != "" {
 		procExporter := collectors.NewProcessCollector(collectors.ProcessCollectorOpts{
 			PidFn:     prometheus.NewPidFileFn(*haProxyPidFile),
@@ -618,7 +696,9 @@ func main() {
 		prometheus.MustRegister(procExporter)
 	}
 
-	http.Handle(*metricsPath, promhttp.Handler())
+	// 配置HTTP路由，配置API断点
+	http.Handle(*metricsPath, promhttp.Handler()) // metrics端点
+	// 返回HTML导航页面
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
              <head><title>Haproxy Exporter</title></head>
@@ -628,6 +708,8 @@ func main() {
              </body>
              </html>`))
 	})
+
+	// 启动HTTP服务器
 	srv := &http.Server{}
 	if err := web.ListenAndServe(srv, webConfig, logger); err != nil {
 		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
