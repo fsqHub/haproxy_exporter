@@ -205,7 +205,8 @@ graph TD
 
 1. 服务启动时通过prometheus.MustRegister(exporter)注册采集器
 2. HTTP服务器配置http.Handle(*metricsPath, promhttp.Handler())
-3. 当访问/metrics端点时，Prometheus客户端库自动调用注册的采集器
+3. 当访问/metrics端点时，`promhttp.Handler()`自动调用已注册采集器的Collect方法
+4. 通过管道ch chan<- prometheus.Metric发送指标数据
 
 ### 方法作用时机
 | 方法名   | 触发时机               | 触发条件                     |
